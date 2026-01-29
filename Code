@@ -1,0 +1,383 @@
+#include <iostream>
+#include <vector>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <cstdlib>
+#include <ctime>
+
+using namespace std;
+
+// ----------------- CONSTANTS -----------------
+#define MAX_PROCESSES 20        // Max number of processes
+#define MAX_RESOURCES 3         // Max types of resources
+#define TIME_QUANTUM 2          // Time quantum for Round Robin
+#define BUFFER_SIZE 5           // Producer-Consumer buffer size
+
+// ----------------- PROCESS STRUCT -----------------
+struct Process {
+    int pid;                    // Process ID
+    int arrival_time = 0;       // Arrival time
+    int burst_time = 0;         // CPU burst time
+    int remaining_time = 0;     // Remaining time for RR
+    int priority = 0;           // Process priority
+    int waiting_time = 0;       // Waiting time
+    int turnaround_time = 0;    // Turnaround time
+
+    int max[MAX_RESOURCES] = {0};        // Max resources needed
+    int allocation[MAX_RESOURCES] = {0}; // Currently allocated resources
+    int need[MAX_RESOURCES] = {0};       // Remaining need (max - allocation)
+};
+
+// ----------------- GLOBAL VARIABLES -----------------
+
+// Ready queue for CPU scheduling
+vector<Process> readyQueueCPU;
+
+// Producer-Consumer buffer
+Process buffer[BUFFER_SIZE];
+int buf_in = 0;
+int buf_out = 0;
+sem_t emptySlots;                 // Semaphore for empty slots
+sem_t fullSlots;                  // Semaphore for full slots
+pthread_mutex_t mutex;            // Mutex for critical section
+
+// Banker Algorithm
+vector<Process> processesBanker;
+vector<Process> blockedQueue;
+int available[MAX_RESOURCES];     // Available resources
+
+// PID counter (unique across all modules)
+int globalPID = 1;
+
+// ----------------- HELPER FUNCTIONS -----------------
+
+// Add process to CPU ready queue
+void enqueueCPU(Process p) {
+    readyQueueCPU.push_back(p);
+}
+
+// Count of processes in CPU ready queue
+int readyCountCPU() {
+    return readyQueueCPU.size();
+}
+
+// ----------------- CPU SCHEDULING MODULE -----------------
+
+// Non-preemptive Priority Scheduling
+void priorityScheduling() {
+    int time = 0;
+    cout << "\nGantt Chart (Priority Scheduling):\n";
+
+    for (int i = 0; i < readyQueueCPU.size(); i++) {
+        int highest = i;
+        for (int j = i + 1; j < readyQueueCPU.size(); j++) {
+            if (readyQueueCPU[j].priority < readyQueueCPU[highest].priority)
+                highest = j;
+        }
+        swap(readyQueueCPU[i], readyQueueCPU[highest]);
+
+        // Calculate waiting & turnaround times
+        readyQueueCPU[i].waiting_time = time - readyQueueCPU[i].arrival_time;
+        time += readyQueueCPU[i].burst_time;
+        readyQueueCPU[i].turnaround_time = readyQueueCPU[i].waiting_time + readyQueueCPU[i].burst_time;
+
+        cout << "| P" << readyQueueCPU[i].pid << " ";
+    }
+    cout << "|\n";
+}
+
+// Preemptive Round Robin Scheduling
+void roundRobinScheduling() {
+    int time = 0;
+    int done;
+    cout << "\nGantt Chart (Round Robin):\n";
+
+    do {
+        done = 1;
+        for (int i = 0; i < readyQueueCPU.size(); i++) {
+            if (readyQueueCPU[i].remaining_time > 0) {
+                done = 0;
+                cout << "| P" << readyQueueCPU[i].pid << " ";
+                if (readyQueueCPU[i].remaining_time > TIME_QUANTUM) {
+                    time += TIME_QUANTUM;
+                    readyQueueCPU[i].remaining_time -= TIME_QUANTUM;
+                } else {
+                    time += readyQueueCPU[i].remaining_time;
+                    readyQueueCPU[i].waiting_time = time - readyQueueCPU[i].arrival_time - readyQueueCPU[i].burst_time;
+                    readyQueueCPU[i].turnaround_time = time - readyQueueCPU[i].arrival_time;
+                    readyQueueCPU[i].remaining_time = 0;
+                }
+            }
+        }
+    } while (!done);
+    cout << "|\n";
+}
+
+// Scheduler selection rule
+void scheduleCPU() {
+    if (readyCountCPU() <= 5)
+        priorityScheduling();
+    else
+        roundRobinScheduling();
+
+    // Display waiting time and turnaround time for all processes
+    cout << "\nProcess\tWT\tTAT\n";
+    double avgWT = 0, avgTAT = 0;
+    for (auto &p : readyQueueCPU) {
+        cout << "P" << p.pid << "\t" << p.waiting_time << "\t" << p.turnaround_time << endl;
+        avgWT += p.waiting_time;
+        avgTAT += p.turnaround_time;
+    }
+
+    // Calculate and display average statistics
+    if (!readyQueueCPU.empty()) {
+        avgWT /= readyQueueCPU.size();
+        avgTAT /= readyQueueCPU.size();
+        cout << "Average WT: " << avgWT << "\nAverage TAT: " << avgTAT << endl;
+    }
+}
+
+// ----------------- PRODUCER-CONSUMER MODULE -----------------
+
+// Producer thread function
+void* producer(void* arg) {
+    int id = *(int*)arg;
+    srand(time(nullptr) + id);
+
+    for (int i = 0; i < 5; i++) {
+        Process p;
+        p.pid = globalPID++;
+        p.arrival_time = 0;
+        p.burst_time = rand() % 10 + 1;
+        p.remaining_time = p.burst_time;
+        p.priority = rand() % 5 + 1;
+        for (int j = 0; j < MAX_RESOURCES; j++) {
+            p.max[j] = rand() % 3 + 1;
+            p.allocation[j] = 0;
+            p.need[j] = p.max[j];
+        }
+
+        // Wait for empty slot and lock mutex
+        sem_wait(&emptySlots);
+        pthread_mutex_lock(&mutex);
+
+        buffer[buf_in] = p;                 // Insert into buffer
+        buf_in = (buf_in + 1) % BUFFER_SIZE;
+        cout << "Producer " << id << " produced P" << p.pid << endl;
+
+        pthread_mutex_unlock(&mutex);
+        sem_post(&fullSlots);
+
+        sleep(1); // Simulate production time
+    }
+    pthread_exit(nullptr);
+}
+
+// Consumer thread function
+void* consumer(void*) {
+    int totalToConsume = 10;
+    int consumed = 0;
+
+    while (consumed < totalToConsume) {
+        sem_wait(&fullSlots);
+        pthread_mutex_lock(&mutex);
+
+        Process p = buffer[buf_out];        // Fetch from buffer
+        buf_out = (buf_out + 1) % BUFFER_SIZE;
+
+        enqueueCPU(p);                      // Send to CPU scheduler
+        cout << "Consumer consumed P" << p.pid << endl;
+
+        pthread_mutex_unlock(&mutex);
+        sem_post(&emptySlots);
+
+        consumed++;
+        sleep(1); // Simulate CPU fetch time
+    }
+    pthread_exit(nullptr);
+}
+
+// Run Producer-Consumer simulation
+void runProducerConsumer() {
+    pthread_t prod1, prod2, cons;
+    int id1 = 1, id2 = 2;
+
+    sem_init(&emptySlots, 0, BUFFER_SIZE);
+    sem_init(&fullSlots, 0, 0);
+    pthread_mutex_init(&mutex, nullptr);
+
+    pthread_create(&prod1, nullptr, producer, &id1);
+    pthread_create(&prod2, nullptr, producer, &id2);
+    pthread_create(&cons, nullptr, consumer, nullptr);
+
+    pthread_join(prod1, nullptr);
+    pthread_join(prod2, nullptr);
+    pthread_join(cons, nullptr);
+
+    sem_destroy(&emptySlots);
+    sem_destroy(&fullSlots);
+    pthread_mutex_destroy(&mutex);
+}
+
+// ----------------- BANKER'S ALGORITHM MODULE -----------------
+
+// Calculate remaining need for all processes
+void calculateNeed() {
+    for (auto &p : processesBanker)
+        for (int i = 0; i < MAX_RESOURCES; i++)
+            p.need[i] = p.max[i] - p.allocation[i];
+}
+
+// Check if system is in safe state
+bool isSafe(vector<int> &safeSeq) {
+    int work[MAX_RESOURCES];
+    bool finish[MAX_PROCESSES] = {false};
+    for (int i = 0; i < MAX_RESOURCES; i++)
+        work[i] = available[i];
+
+    int count = 0;
+    while (count < processesBanker.size()) {
+        bool found = false;
+        for (int i = 0; i < processesBanker.size(); i++) {
+            if (!finish[i]) {
+                bool canRun = true;
+                for (int j = 0; j < MAX_RESOURCES; j++)
+                    if (processesBanker[i].need[j] > work[j])
+                        canRun = false;
+
+                if (canRun) {
+                    for (int j = 0; j < MAX_RESOURCES; j++)
+                        work[j] += processesBanker[i].allocation[j];
+                    finish[i] = true;
+                    safeSeq.push_back(processesBanker[i].pid);
+                    found = true;
+                    count++;
+                }
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+// Handle resource requests from a process
+void requestResources() {
+    int pid, request[MAX_RESOURCES];
+    cout << "Enter Process ID: ";
+    cin >> pid;
+
+    int index = -1;
+    for (int i = 0; i < processesBanker.size(); i++)
+        if (processesBanker[i].pid == pid) index = i;
+
+    if (index == -1) { cout << "Process not found!\n"; return; }
+
+    cout << "Enter resource request (" << MAX_RESOURCES << " types): ";
+    for (int i = 0; i < MAX_RESOURCES; i++)
+        cin >> request[i];
+
+    for (int i = 0; i < MAX_RESOURCES; i++)
+        if (request[i] > processesBanker[index].need[i] || request[i] > available[i]) {
+            cout << "Request cannot be granted. Process BLOCKED.\n";
+            blockedQueue.push_back(processesBanker[index]);
+            return;
+        }
+
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        available[i] -= request[i];
+        processesBanker[index].allocation[i] += request[i];
+        processesBanker[index].need[i] -= request[i];
+    }
+
+    vector<int> safeSeq;
+    if (!isSafe(safeSeq)) {
+        for (int i = 0; i < MAX_RESOURCES; i++) {
+            available[i] += request[i];
+            processesBanker[index].allocation[i] -= request[i];
+            processesBanker[index].need[i] += request[i];
+        }
+        cout << "System UNSAFE! Process BLOCKED.\n";
+        blockedQueue.push_back(processesBanker[index]);
+    } else {
+        cout << "Request granted safely. Safe Sequence: ";
+        for (int pid : safeSeq) cout << "P" << pid << " ";
+        cout << endl;
+    }
+}
+
+// Add a new process manually
+void addProcessBanker() {
+    if (processesBanker.size() >= MAX_PROCESSES) { cout << "Process limit reached!\n"; return; }
+    Process p; p.pid = globalPID++;
+    cout << "Enter allocation: ";
+    for (int i = 0; i < MAX_RESOURCES; i++) cin >> p.allocation[i];
+    cout << "Enter max: ";
+    for (int i = 0; i < MAX_RESOURCES; i++) cin >> p.max[i];
+    processesBanker.push_back(p);
+    calculateNeed();
+    cout << "Process added successfully. PID = " << p.pid << endl;  // <<< Add this line
+}
+
+
+// Display system state (resources, processes, blocked queue)
+void displayStateBanker() {
+    cout << "\nAvailable Resources: ";
+    for (int i = 0; i < MAX_RESOURCES; i++) cout << available[i] << " ";
+    cout << "\n\nPID\tAllocation\tMax\tNeed\n";
+    for (auto &p : processesBanker) {
+        cout << "P" << p.pid << "\t";
+        for (int i = 0; i < MAX_RESOURCES; i++) cout << p.allocation[i] << " ";
+        cout << "\t";
+        for (int i = 0; i < MAX_RESOURCES; i++) cout << p.max[i] << " ";
+        cout << "\t";
+        for (int i = 0; i < MAX_RESOURCES; i++) cout << p.need[i] << " ";
+        cout << endl;
+    }
+
+    cout << "Blocked Processes: ";
+    if (blockedQueue.empty()) cout << "None";
+    else for (auto &p : blockedQueue) cout << "P" << p.pid << " ";
+    cout << endl;
+}
+
+// ----------------- MAIN MENU -----------------
+int main() {
+    srand(time(nullptr));
+    int choice;
+
+    // Initialize available resources for Banker Algorithm
+    cout << "Enter available resources (" << MAX_RESOURCES << " types) for Banker Algorithm: ";
+    for (int i = 0; i < MAX_RESOURCES; i++) cin >> available[i];
+
+    do {
+        cout << "\n===== MINI OS SIMULATOR =====\n";
+        cout << "1. Run Producer-Consumer Simulation\n";
+        cout << "2. Run CPU Scheduling\n";
+        cout << "3. Run Banker Algorithm\n";
+        cout << "4. Exit\n";
+        cout << "Choose: "; cin >> choice;
+
+        switch(choice) {
+            case 1: runProducerConsumer(); break;
+            case 2: scheduleCPU(); break;
+            case 3: {
+                int subchoice;
+                cout << "\nBanker Menu:\n1. Request Resources\n2. Add Process\n3. Display State\n4. Back\nChoose: ";
+                cin >> subchoice;
+                switch(subchoice) {
+                    case 1: requestResources(); break;
+                    case 2: addProcessBanker(); break;
+                    case 3: displayStateBanker(); break;
+                    case 4: break;
+                    default: cout << "Invalid choice!\n";
+                }
+                break;
+            }
+            case 4: cout << "Exiting...\n"; break;
+            default: cout << "Invalid choice!\n";
+        }
+    } while(choice != 4);
+
+    return 0;
+}
